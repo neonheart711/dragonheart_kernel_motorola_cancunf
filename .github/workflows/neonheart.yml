@@ -7,12 +7,12 @@ jobs:
   build-kernel:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. Download Kernel Source
+      - name: 1. Checkout Kernel Source
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: 2. Install Required Tools
+      - name: 2. Install Build Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -20,7 +20,7 @@ jobs:
             zip unzip curl python3 cpio llvm lld clang \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
-      - name: 3. Download Compiler (Neutron Clang)
+      - name: 3. Setup Neutron Clang Toolchain
         run: |
           mkdir -p "$HOME/clang"
           cd "$HOME/clang"
@@ -28,20 +28,20 @@ jobs:
           chmod +x antman
           ./antman -S
 
-      - name: 4. Load dragonheart_defconfig & Add NetHunter + WiFi Drivers
+      - name: 4. Configure Kernel and Add NetHunter Drivers
         run: |
           export PATH="$HOME/clang/bin:$PATH"
 
-          # ১. আপনার বর্তমান কার্নেলের আসল dragonheart_defconfig লোড করা হচ্ছে
+          # Clear EXTRAVERSION in Makefile and load base dragonheart_defconfig
           sed -i 's/^EXTRAVERSION =.*/EXTRAVERSION =/' Makefile
           make O=out ARCH=arm64 dragonheart_defconfig
 
-          # যদি cancunf.config ফাইলটিতে অতিরিক্ত ডিভাইস কনফিগ থাকে তবে সেটিও যুক্ত করা হচ্ছে
+          # Merge device-specific cancunf.config if present
           if [ -f "arch/arm64/configs/cancunf.config" ]; then
             cat arch/arm64/configs/cancunf.config >> out/.config
           fi
 
-          # ২. এক্সটার্নাল RTL8812AU / RTL8821AU (5GHz) ড্রাইভার অটোমেটিক ডাউনলোড ও যুক্ত করা
+          # Clone and integrate external RTL8812AU / RTL8821AU (5GHz) driver
           git clone --depth=1 -b v5.6.4.2 https://github.com/aircrack-ng/rtl8812au.git drivers/net/wireless/realtek/rtl8812au || true
           if [ -d "drivers/net/wireless/realtek/rtl8812au" ]; then
             echo 'obj-$(CONFIG_88XXAU) += rtl8812au/' >> drivers/net/wireless/realtek/Makefile
@@ -50,7 +50,7 @@ jobs:
             echo "EXTRA_CFLAGS += -Wno-error" >> drivers/net/wireless/realtek/rtl8812au/Makefile
           fi
 
-          # ৩. কার্নেলের নাম NeonHeart করা এবং MT7601U, RTL8812AU, HID ও NetHunter চালু করা
+          # Append NeonHeart branding, MT7601U, RTL8812AU, HID, and Kali NetHunter configs
           cat << 'EOF' >> out/.config
           CONFIG_LOCALVERSION="-NeonHeart-NetHunter"
           CONFIG_LOCALVERSION_AUTO=n
@@ -108,7 +108,7 @@ jobs:
 
           make O=out ARCH=arm64 olddefconfig
 
-      - name: 5. Build NeonHeart Kernel
+      - name: 5. Compile NeonHeart Kernel
         run: |
           export PATH="$HOME/clang/bin:$PATH"
           export KBUILD_BUILD_USER="neonheart711"
@@ -128,7 +128,7 @@ jobs:
             LLVM=1 \
             LLVM_IAS=1 \
             KCFLAGS="-Wno-error" || {
-              echo "Fixing external driver conflict and retrying build..."
+              echo "External driver conflict detected, retrying clean build..."
               sed -i '/rtl8812au/d' drivers/net/wireless/realtek/Makefile
               rm -rf drivers/net/wireless/realtek/rtl8812au
               make O=out ARCH=arm64 olddefconfig
@@ -148,7 +148,7 @@ jobs:
                 KCFLAGS="-Wno-error"
             }
 
-      - name: 6. Create Flashable Zip (AnyKernel3)
+      - name: 6. Package Kernel with AnyKernel3
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
 
@@ -171,7 +171,7 @@ jobs:
           cd AnyKernel3
           zip -r9 ../NeonHeart-NetHunter-cancunf.zip * -x .git README.md *placeholder
 
-      - name: 7. Upload Finished Kernel Zip
+      - name: 7. Upload Flashable Zip Artifact
         uses: actions/upload-artifact@v4
         with:
           name: NeonHeart-NetHunter-Kernel
