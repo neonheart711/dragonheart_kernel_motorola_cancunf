@@ -1,1 +1,179 @@
+name: Build NeonHeart NetHunter Kernel
 
+on:
+  workflow_dispatch:
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Download Kernel Source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 2. Install Required Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git bc bison flex libssl-dev make libc6-dev libncurses-dev \
+            zip unzip curl python3 cpio llvm lld clang \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: 3. Download Compiler (Neutron Clang)
+        run: |
+          mkdir -p "$HOME/clang"
+          cd "$HOME/clang"
+          curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+          chmod +x antman
+          ./antman -S
+
+      - name: 4. Load dragonheart_defconfig & Add NetHunter + WiFi Drivers
+        run: |
+          export PATH="$HOME/clang/bin:$PATH"
+
+          # ১. আপনার বর্তমান কার্নেলের আসল dragonheart_defconfig লোড করা হচ্ছে
+          sed -i 's/^EXTRAVERSION =.*/EXTRAVERSION =/' Makefile
+          make O=out ARCH=arm64 dragonheart_defconfig
+
+          # যদি cancunf.config ফাইলটিতে অতিরিক্ত ডিভাইস কনফিগ থাকে তবে সেটিও যুক্ত করা হচ্ছে
+          if [ -f "arch/arm64/configs/cancunf.config" ]; then
+            cat arch/arm64/configs/cancunf.config >> out/.config
+          fi
+
+          # ২. এক্সটার্নাল RTL8812AU / RTL8821AU (5GHz) ড্রাইভার অটোমেটিক ডাউনলোড ও যুক্ত করা
+          git clone --depth=1 -b v5.6.4.2 https://github.com/aircrack-ng/rtl8812au.git drivers/net/wireless/realtek/rtl8812au || true
+          if [ -d "drivers/net/wireless/realtek/rtl8812au" ]; then
+            echo 'obj-$(CONFIG_88XXAU) += rtl8812au/' >> drivers/net/wireless/realtek/Makefile
+            sed -i 's/CONFIG_PLATFORM_I386_PC = y/CONFIG_PLATFORM_I386_PC = n/g' drivers/net/wireless/realtek/rtl8812au/Makefile
+            sed -i 's/CONFIG_PLATFORM_ANDROID_ARM64 = n/CONFIG_PLATFORM_ANDROID_ARM64 = y/g' drivers/net/wireless/realtek/rtl8812au/Makefile
+            echo "EXTRA_CFLAGS += -Wno-error" >> drivers/net/wireless/realtek/rtl8812au/Makefile
+          fi
+
+          # ৩. কার্নেলের নাম NeonHeart করা এবং MT7601U, RTL8812AU, HID ও NetHunter চালু করা
+          cat << 'EOF' >> out/.config
+          CONFIG_LOCALVERSION="-NeonHeart-NetHunter"
+          CONFIG_LOCALVERSION_AUTO=n
+          CONFIG_WERROR=n
+          CONFIG_SYSVIPC=y
+          CONFIG_POSIX_MQUEUE=y
+          CONFIG_NAMESPACES=y
+          CONFIG_NET_NS=y
+          CONFIG_PID_NS=y
+          CONFIG_IPC_NS=y
+          CONFIG_UTS_NS=y
+          CONFIG_USB_GADGET=y
+          CONFIG_USB_CONFIGFS=y
+          CONFIG_USB_CONFIGFS_UEVENT=y
+          CONFIG_USB_CONFIGFS_SERIAL=y
+          CONFIG_USB_CONFIGFS_ACM=y
+          CONFIG_USB_CONFIGFS_ECM=y
+          CONFIG_USB_CONFIGFS_RNDIS=y
+          CONFIG_USB_CONFIGFS_MASS_STORAGE=y
+          CONFIG_USB_CONFIGFS_F_HID=y
+          CONFIG_CFG80211=y
+          CONFIG_CFG80211_WEXT=y
+          CONFIG_MAC80211=y
+          CONFIG_MAC80211_MESH=y
+          CONFIG_MAC80211_LEDS=y
+          CONFIG_WIRELESS_EXT=y
+          CONFIG_WEXT_PRIV=y
+          CONFIG_WLAN_VENDOR_MEDIATEK=y
+          CONFIG_MT7601U=y
+          CONFIG_WLAN_VENDOR_REALTEK=y
+          CONFIG_88XXAU=y
+          CONFIG_RTL8187=y
+          CONFIG_RTLWIFI=y
+          CONFIG_RTL8192CU=y
+          CONFIG_RTL8XXXU=y
+          CONFIG_RTL8XXXU_UNTESTED=y
+          CONFIG_USB_NET_DRIVERS=y
+          CONFIG_USB_RTL8152=y
+          CONFIG_ATH_CARDS=y
+          CONFIG_ATH9K_HTC=y
+          CONFIG_CARL9170=y
+          CONFIG_RT2X00=y
+          CONFIG_RT2800USB=y
+          CONFIG_RT2800USB_RT33XX=y
+          CONFIG_RT2800USB_RT35XX=y
+          CONFIG_RT2800USB_RT3573=y
+          CONFIG_RT2800USB_RT53XX=y
+          CONFIG_RT2800USB_RT55XX=y
+          CONFIG_BT=y
+          CONFIG_BT_RFCOMM=y
+          CONFIG_BT_RFCOMM_TTY=y
+          CONFIG_BT_BNEP=y
+          CONFIG_BT_HCIUSB=y
+          EOF
+
+          make O=out ARCH=arm64 olddefconfig
+
+      - name: 5. Build NeonHeart Kernel
+        run: |
+          export PATH="$HOME/clang/bin:$PATH"
+          export KBUILD_BUILD_USER="neonheart711"
+          export KBUILD_BUILD_HOST="NeonHeart"
+
+          make -j$(nproc --all) O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            KCFLAGS="-Wno-error" || {
+              echo "Fixing external driver conflict and retrying build..."
+              sed -i '/rtl8812au/d' drivers/net/wireless/realtek/Makefile
+              rm -rf drivers/net/wireless/realtek/rtl8812au
+              make O=out ARCH=arm64 olddefconfig
+              make -j$(nproc --all) O=out \
+                ARCH=arm64 \
+                CC=clang \
+                LD=ld.lld \
+                AR=llvm-ar \
+                NM=llvm-nm \
+                OBJCOPY=llvm-objcopy \
+                OBJDUMP=llvm-objdump \
+                STRIP=llvm-strip \
+                CROSS_COMPILE=aarch64-linux-gnu- \
+                CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+                LLVM=1 \
+                LLVM_IAS=1 \
+                KCFLAGS="-Wno-error"
+            }
+
+      - name: 6. Create Flashable Zip (AnyKernel3)
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+
+          if [ -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
+            cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+          elif [ -f "out/arch/arm64/boot/Image.gz" ]; then
+            cp out/arch/arm64/boot/Image.gz AnyKernel3/
+          elif [ -f "out/arch/arm64/boot/Image" ]; then
+            cp out/arch/arm64/boot/Image AnyKernel3/
+          else
+            echo "Kernel Image not found!" && exit 1
+          fi
+
+          sed -i 's/kernel.string=.*/kernel.string=NeonHeart NetHunter Kernel by neonheart711/g' AnyKernel3/anykernel.sh
+          sed -i 's/device.name1=.*/device.name1=cancunf/g' AnyKernel3/anykernel.sh
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
+          sed -i 's|block=.*|block=/dev/block/by-name/boot;|g' AnyKernel3/anykernel.sh
+          sed -i 's/is_slot_device=0;/is_slot_device=1;/g' AnyKernel3/anykernel.sh
+
+          cd AnyKernel3
+          zip -r9 ../NeonHeart-NetHunter-cancunf.zip * -x .git README.md *placeholder
+
+      - name: 7. Upload Finished Kernel Zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: NeonHeart-NetHunter-Kernel
+          path: NeonHeart-NetHunter-cancunf.zip
+          
