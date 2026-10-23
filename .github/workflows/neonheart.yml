@@ -17,7 +17,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             git bc bison flex libssl-dev make libc6-dev libncurses-dev \
-            zip unzip curl python3 cpio llvm lld clang \
+            zip unzip curl python3 cpio llvm lld clang xz-utils tar \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
       - name: 3. Setup Neutron Clang Toolchain
@@ -28,20 +28,13 @@ jobs:
           chmod +x antman
           ./antman -S
 
-      - name: 4. Configure Kernel and Add NetHunter Drivers
+      - name: 4. Configure Kernel (dragonheart_defconfig + NetHunter)
         run: |
           export PATH="$HOME/clang/bin:$PATH"
 
-          # Clear EXTRAVERSION in Makefile and load base dragonheart_defconfig
           sed -i 's/^EXTRAVERSION =.*/EXTRAVERSION =/' Makefile
           make O=out ARCH=arm64 dragonheart_defconfig
 
-          # Merge device-specific cancunf.config if present
-          if [ -f "arch/arm64/configs/cancunf.config" ]; then
-            cat arch/arm64/configs/cancunf.config >> out/.config
-          fi
-
-          # Clone and integrate external RTL8812AU / RTL8821AU (5GHz) driver
           git clone --depth=1 -b v5.6.4.2 https://github.com/aircrack-ng/rtl8812au.git drivers/net/wireless/realtek/rtl8812au || true
           if [ -d "drivers/net/wireless/realtek/rtl8812au" ]; then
             echo 'obj-$(CONFIG_88XXAU) += rtl8812au/' >> drivers/net/wireless/realtek/Makefile
@@ -50,7 +43,6 @@ jobs:
             echo "EXTRA_CFLAGS += -Wno-error" >> drivers/net/wireless/realtek/rtl8812au/Makefile
           fi
 
-          # Append NeonHeart branding, MT7601U, RTL8812AU, HID, and Kali NetHunter configs
           cat << 'EOF' >> out/.config
           CONFIG_LOCALVERSION="-NeonHeart-NetHunter"
           CONFIG_LOCALVERSION_AUTO=n
@@ -108,7 +100,7 @@ jobs:
 
           make O=out ARCH=arm64 olddefconfig
 
-      - name: 5. Compile NeonHeart Kernel
+      - name: 5. Compile Kernel, Modules & DTB
         run: |
           export PATH="$HOME/clang/bin:$PATH"
           export KBUILD_BUILD_USER="neonheart711"
@@ -128,7 +120,6 @@ jobs:
             LLVM=1 \
             LLVM_IAS=1 \
             KCFLAGS="-Wno-error" || {
-              echo "External driver conflict detected, retrying clean build..."
               sed -i '/rtl8812au/d' drivers/net/wireless/realtek/Makefile
               rm -rf drivers/net/wireless/realtek/rtl8812au
               make O=out ARCH=arm64 olddefconfig
@@ -148,28 +139,57 @@ jobs:
                 KCFLAGS="-Wno-error"
             }
 
-      - name: 6. Package Kernel with AnyKernel3
+      - name: 6. Repackage Using Original Kernel Zip Structure
         run: |
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
-
-          if [ -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
-            cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
-          elif [ -f "out/arch/arm64/boot/Image.gz" ]; then
-            cp out/arch/arm64/boot/Image.gz AnyKernel3/
-          elif [ -f "out/arch/arm64/boot/Image" ]; then
-            cp out/arch/arm64/boot/Image AnyKernel3/
-          else
-            echo "Kernel Image not found!" && exit 1
+          export PATH="$HOME/clang/bin:$PATH"
+          if [ ! -f "original_kernel.zip" ]; then
+            echo "ERROR: Please upload original_kernel.zip to the root of your repository!"
+            exit 1
           fi
 
-          sed -i 's/kernel.string=.*/kernel.string=NeonHeart NetHunter Kernel by neonheart711/g' AnyKernel3/anykernel.sh
-          sed -i 's/device.name1=.*/device.name1=cancunf/g' AnyKernel3/anykernel.sh
-          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
-          sed -i 's|block=.*|block=/dev/block/by-name/boot;|g' AnyKernel3/anykernel.sh
-          sed -i 's/is_slot_device=0;/is_slot_device=1;/g' AnyKernel3/anykernel.sh
+          mkdir -p AnyKernel3
+          unzip -q original_kernel.zip -d AnyKernel3
+
+          # Replace Image.gz with newly compiled Image.gz
+          cp -f out/arch/arm64/boot/Image.gz AnyKernel3/Image.gz
+
+          # Replace dtb if compiled in out/
+          if [ -f "out/arch/arm64/boot/dtb" ]; then
+            cp -f out/arch/arm64/boot/dtb AnyKernel3/dtb
+          elif compgen -G "out/arch/arm64/boot/dts/mediatek/*.dtb" > /dev/null; then
+            cat out/arch/arm64/boot/dts/mediatek/*.dtb > AnyKernel3/dtb
+          fi
+
+          # Repackage modules/dlkm.tar.xz with newly compiled .ko modules
+          mkdir -p dlkm_work
+          if [ -f "AnyKernel3/modules/dlkm.tar.xz" ]; then
+            tar -xJf AnyKernel3/modules/dlkm.tar.xz -C dlkm_work
+          fi
+
+          # Copy and strip all newly built .ko modules
+          for ko in $(find out -name "*.ko"); do
+            llvm-strip --strip-debug "$ko" || true
+            base_ko=$(basename "$ko")
+            existing=$(find dlkm_work -name "$base_ko" | head -n 1)
+            if [ -n "$existing" ]; then
+              cp -f "$ko" "$existing"
+            else
+              target_dir=$(find dlkm_work -type d | tail -n 1)
+              cp -f "$ko" "${target_dir:-dlkm_work}/"
+            fi
+          done
+
+          cd dlkm_work
+          tar -cJf ../AnyKernel3/modules/dlkm.tar.xz *
+          cd ..
+
+          # Update branding in anykernel.sh if present
+          if [ -f "AnyKernel3/anykernel.sh" ]; then
+            sed -i 's/kernel.string=.*/kernel.string=NeonHeart NetHunter Kernel by neonheart711/g' AnyKernel3/anykernel.sh
+          fi
 
           cd AnyKernel3
-          zip -r9 ../NeonHeart-NetHunter-cancunf.zip * -x .git README.md *placeholder
+          zip -r9 ../NeonHeart-NetHunter-cancunf.zip *
 
       - name: 7. Upload Flashable Zip Artifact
         uses: actions/upload-artifact@v4
