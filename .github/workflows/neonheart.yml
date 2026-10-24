@@ -12,78 +12,55 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: 2. Install Build Dependencies
+      - name: 2. Install Build Dependencies for kramel.sh
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            git bc bison flex libssl-dev make libc6-dev libncurses-dev \
-            zip unzip curl python3 cpio llvm lld clang xz-utils tar \
+            git bc bison flex libssl-dev libelf-dev make libc6-dev libncurses-dev \
+            zip unzip curl wget dialog python3 cpio lz4 kmod xz-utils tar dwarves \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
-      - name: 3. Setup Neutron Clang Toolchain
+      - name: 3. Inject NetHunter & Wi-Fi Drivers into dragonheart_defconfig
         run: |
-          mkdir -p "$HOME/clang"
-          cd "$HOME/clang"
-          curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
-          chmod +x antman
-          ./antman -S
+          # Remove uploaded original_kernel.zip if present to keep working tree clean
+          rm -f original_kernel.zip
 
-      - name: 4. Configure Kernel (dragonheart_defconfig + NetHunter)
-        run: |
-          export PATH="$HOME/clang/bin:$PATH"
-
-          sed -i 's/^EXTRAVERSION =.*/EXTRAVERSION =/' Makefile
-          make O=out ARCH=arm64 dragonheart_defconfig
-
+          # Integrate external RTL8812AU / RTL8821AU (5GHz) driver as a loadable module
           git clone --depth=1 -b v5.6.4.2 https://github.com/aircrack-ng/rtl8812au.git drivers/net/wireless/realtek/rtl8812au || true
           if [ -d "drivers/net/wireless/realtek/rtl8812au" ]; then
             echo 'obj-$(CONFIG_88XXAU) += rtl8812au/' >> drivers/net/wireless/realtek/Makefile
             sed -i 's/CONFIG_PLATFORM_I386_PC = y/CONFIG_PLATFORM_I386_PC = n/g' drivers/net/wireless/realtek/rtl8812au/Makefile
             sed -i 's/CONFIG_PLATFORM_ANDROID_ARM64 = n/CONFIG_PLATFORM_ANDROID_ARM64 = y/g' drivers/net/wireless/realtek/rtl8812au/Makefile
-            echo "EXTRA_CFLAGS += -Wno-error" >> drivers/net/wireless/realtek/rtl8812au/Makefile
+            echo "EXTRA_CFLAGS += -Wno-error -Wno-incompatible-pointer-types -Wno-enum-conversion" >> drivers/net/wireless/realtek/rtl8812au/Makefile
+            if ! grep -q "rtl8812au/Kconfig" drivers/net/wireless/realtek/Kconfig; then
+              sed -i '/endif/i source "drivers/net/wireless/realtek/rtl8812au/Kconfig"' drivers/net/wireless/realtek/Kconfig
+            fi
           fi
 
-          cat << 'EOF' >> out/.config
-          CONFIG_LOCALVERSION="-NeonHeart-NetHunter"
+          # Append NeonHeart name, NetHunter, HID, and Wi-Fi Adapter configs to dragonheart_defconfig
+          cat << 'EOF' >> arch/arm64/configs/dragonheart_defconfig
+          CONFIG_LOCALVERSION="-NeonHeart"
           CONFIG_LOCALVERSION_AUTO=n
-          CONFIG_WERROR=n
           CONFIG_SYSVIPC=y
           CONFIG_POSIX_MQUEUE=y
-          CONFIG_NAMESPACES=y
-          CONFIG_NET_NS=y
-          CONFIG_PID_NS=y
-          CONFIG_IPC_NS=y
-          CONFIG_UTS_NS=y
-          CONFIG_USB_GADGET=y
-          CONFIG_USB_CONFIGFS=y
-          CONFIG_USB_CONFIGFS_UEVENT=y
-          CONFIG_USB_CONFIGFS_SERIAL=y
+          CONFIG_USB_CONFIGFS_F_HID=y
           CONFIG_USB_CONFIGFS_ACM=y
           CONFIG_USB_CONFIGFS_ECM=y
           CONFIG_USB_CONFIGFS_RNDIS=y
           CONFIG_USB_CONFIGFS_MASS_STORAGE=y
-          CONFIG_USB_CONFIGFS_F_HID=y
-          CONFIG_CFG80211=y
           CONFIG_CFG80211_WEXT=y
           CONFIG_MAC80211=y
           CONFIG_MAC80211_MESH=y
-          CONFIG_MAC80211_LEDS=y
-          CONFIG_WIRELESS_EXT=y
-          CONFIG_WEXT_PRIV=y
           CONFIG_WLAN_VENDOR_MEDIATEK=y
           CONFIG_MT7601U=y
           CONFIG_WLAN_VENDOR_REALTEK=y
-          CONFIG_88XXAU=y
+          CONFIG_88XXAU=m
           CONFIG_RTL8187=y
           CONFIG_RTLWIFI=y
           CONFIG_RTL8192CU=y
           CONFIG_RTL8XXXU=y
           CONFIG_RTL8XXXU_UNTESTED=y
-          CONFIG_USB_NET_DRIVERS=y
-          CONFIG_USB_RTL8152=y
-          CONFIG_ATH_CARDS=y
-          CONFIG_ATH9K_HTC=y
-          CONFIG_CARL9170=y
+          CONFIG_WLAN_VENDOR_RALINK=y
           CONFIG_RT2X00=y
           CONFIG_RT2800USB=y
           CONFIG_RT2800USB_RT33XX=y
@@ -91,109 +68,66 @@ jobs:
           CONFIG_RT2800USB_RT3573=y
           CONFIG_RT2800USB_RT53XX=y
           CONFIG_RT2800USB_RT55XX=y
-          CONFIG_BT=y
+          CONFIG_WLAN_VENDOR_ATH=y
+          CONFIG_ATH_CARDS=y
+          CONFIG_ATH9K_HTC=y
+          CONFIG_CARL9170=y
+          CONFIG_USB_RTL8152=y
+          CONFIG_BT_HCIBTUSB=y
           CONFIG_BT_RFCOMM=y
           CONFIG_BT_RFCOMM_TTY=y
-          CONFIG_BT_BNEP=y
-          CONFIG_BT_HCIUSB=y
           EOF
 
-          make O=out ARCH=arm64 olddefconfig
-
-      - name: 5. Compile Kernel, Modules & DTB
+      - name: 4. Configure Official kramel.sh for NeonHeart
         run: |
-          export PATH="$HOME/clang/bin:$PATH"
-          export KBUILD_BUILD_USER="neonheart711"
-          export KBUILD_BUILD_HOST="NeonHeart"
+          # Prevent CI=1 from overwriting CONFIG_LOCALVERSION back to -DragonHeart
+          sed -i '/upr "\${VERSION}"/d' kramel.sh
 
-          make -j$(nproc --all) O=out \
-            ARCH=arm64 \
-            CC=clang \
-            LD=ld.lld \
-            AR=llvm-ar \
-            NM=llvm-nm \
-            OBJCOPY=llvm-objcopy \
-            OBJDUMP=llvm-objdump \
-            STRIP=llvm-strip \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            LLVM=1 \
-            LLVM_IAS=1 \
-            KCFLAGS="-Wno-error" || {
-              sed -i '/rtl8812au/d' drivers/net/wireless/realtek/Makefile
-              rm -rf drivers/net/wireless/realtek/rtl8812au
-              make O=out ARCH=arm64 olddefconfig
-              make -j$(nproc --all) O=out \
-                ARCH=arm64 \
-                CC=clang \
-                LD=ld.lld \
-                AR=llvm-ar \
-                NM=llvm-nm \
-                OBJCOPY=llvm-objcopy \
-                OBJDUMP=llvm-objdump \
-                STRIP=llvm-strip \
-                CROSS_COMPILE=aarch64-linux-gnu- \
-                CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-                LLVM=1 \
-                LLVM_IAS=1 \
-                KCFLAGS="-Wno-error"
-            }
+          # Verify YAAP modules.load branch availability
+          if curl -sL --fail "https://github.com/yaap/device_motorola_cancunf/raw/staging/modules/modules.load.vendor_dlkm" >/dev/null; then
+            sed -i 's/export MOD_BRANCH=.*/export MOD_BRANCH="staging"/g' kramel.sh
+          elif curl -sL --fail "https://github.com/yaap/device_motorola_cancunf/raw/sixteen/modules/modules.load.vendor_dlkm" >/dev/null; then
+            sed -i 's/export MOD_BRANCH=.*/export MOD_BRANCH="sixteen"/g' kramel.sh
+          fi
 
-      - name: 6. Repackage Using Original Kernel Zip Structure
+          # Set NeonHeart builder branding in kramel.sh
+          sed -i 's/export BUILDER=.*/export BUILDER="neonheart711"/g' kramel.sh
+          sed -i 's/export KBUILD_BUILD_USER=.*/export KBUILD_BUILD_USER="neonheart711"/g' kramel.sh
+          sed -i 's/export KBUILD_BUILD_HOST=.*/export KBUILD_BUILD_HOST="NeonHeart"/g' kramel.sh
+          sed -i 's/zipn=DragonHeart-/zipn=NeonHeart-NetHunter-/g' kramel.sh
+
+          # Include 88XXau.ko in vendor_dlkm if built
+          sed -i '/depmod -b "\${DLKM_DIR}" 0.0/i if [ -f "\${DIST_DIR}/88XXau.ko" ]; then cp -p "\${DIST_DIR}/88XXau.ko" "\${DLKM_MODULES_DIR_FULL}"/; fi' kramel.sh
+
+      - name: 5. Build Kernel, DTB, Modules & Zip via kramel.sh
         run: |
-          export PATH="$HOME/clang/bin:$PATH"
-          if [ ! -f "original_kernel.zip" ]; then
-            echo "ERROR: Please upload original_kernel.zip to the root of your repository!"
-            exit 1
+          export CI=0
+          export OTA=0
+          export TGI=0
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          chmod +x kramel.sh
+          bash kramel.sh img mod || {
+            echo "External rtl8812au driver had a compiler conflict, rebuilding with in-tree drivers..."
+            sed -i '/rtl8812au/d' drivers/net/wireless/realtek/Makefile
+            sed -i '/rtl8812au/d' drivers/net/wireless/realtek/Kconfig
+            sed -i '/CONFIG_88XXAU/d' arch/arm64/configs/dragonheart_defconfig
+            rm -rf drivers/net/wireless/realtek/rtl8812au
+            bash kramel.sh clean
+            bash kramel.sh img mod
+          }
+
+          # Set NeonHeart banner in AnyKernel3
+          if [ -f "anykernel3-dragonheart/anykernel.sh" ]; then
+            sed -i 's/kernel.string=.*/kernel.string=NeonHeart NetHunter Kernel by neonheart711/g' anykernel3-dragonheart/anykernel.sh
           fi
 
-          mkdir -p AnyKernel3
-          unzip -q original_kernel.zip -d AnyKernel3
+          bash kramel.sh mkzip
 
-          # Replace Image.gz with newly compiled Image.gz
-          cp -f out/arch/arm64/boot/Image.gz AnyKernel3/Image.gz
-
-          # Replace dtb if compiled in out/
-          if [ -f "out/arch/arm64/boot/dtb" ]; then
-            cp -f out/arch/arm64/boot/dtb AnyKernel3/dtb
-          elif compgen -G "out/arch/arm64/boot/dts/mediatek/*.dtb" > /dev/null; then
-            cat out/arch/arm64/boot/dts/mediatek/*.dtb > AnyKernel3/dtb
-          fi
-
-          # Repackage modules/dlkm.tar.xz with newly compiled .ko modules
-          mkdir -p dlkm_work
-          if [ -f "AnyKernel3/modules/dlkm.tar.xz" ]; then
-            tar -xJf AnyKernel3/modules/dlkm.tar.xz -C dlkm_work
-          fi
-
-          # Copy and strip all newly built .ko modules
-          for ko in $(find out -name "*.ko"); do
-            llvm-strip --strip-debug "$ko" || true
-            base_ko=$(basename "$ko")
-            existing=$(find dlkm_work -name "$base_ko" | head -n 1)
-            if [ -n "$existing" ]; then
-              cp -f "$ko" "$existing"
-            else
-              target_dir=$(find dlkm_work -type d | tail -n 1)
-              cp -f "$ko" "${target_dir:-dlkm_work}/"
-            fi
-          done
-
-          cd dlkm_work
-          tar -cJf ../AnyKernel3/modules/dlkm.tar.xz *
-          cd ..
-
-          # Update branding in anykernel.sh if present
-          if [ -f "AnyKernel3/anykernel.sh" ]; then
-            sed -i 's/kernel.string=.*/kernel.string=NeonHeart NetHunter Kernel by neonheart711/g' AnyKernel3/anykernel.sh
-          fi
-
-          cd AnyKernel3
-          zip -r9 ../NeonHeart-NetHunter-cancunf.zip *
-
-      - name: 7. Upload Flashable Zip Artifact
+      - name: 6. Upload Flashable Kernel Zip
         uses: actions/upload-artifact@v4
         with:
           name: NeonHeart-NetHunter-Kernel
-          path: NeonHeart-NetHunter-cancunf.zip
+          path: anykernel3-dragonheart/*.zip
           
